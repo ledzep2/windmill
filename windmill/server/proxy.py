@@ -22,6 +22,7 @@ import copy
 import sys
 import logging
 import urllib
+import re
 logger = logging.getLogger(__name__)
 from forwardmanager import ForwardManager
 if not sys.version.startswith('2.4'):
@@ -32,7 +33,7 @@ else:
 
 first_forward_domains = []
 exclude_from_retry = ['http://sb-ssl.google.com',
-                      'https://sb-ssl.google.com', 
+                      'https://sb-ssl.google.com',
                       'http://en-us.fxfeeds.mozilla.com',
                       'fxfeeds.mozilla.com',
                       'http://www.google-analytics.com',
@@ -43,18 +44,18 @@ exclude_from_retry = ['http://sb-ssl.google.com',
 _hoppish = {
     'connection':1, 'keep-alive':1, 'proxy-authenticate':1,
     'proxy-authorization':1, 'te':1, 'trailers':1, 'transfer-encoding':1,
-    'upgrade':1, 'proxy-connection':1, 
-    'p3p':1 #Not actually a hop-by-hop header, just really annoying 
+    'upgrade':1, 'proxy-connection':1,
+    'p3p':1 #Not actually a hop-by-hop header, just really annoying
     }
-    
+
 # Cache stopping headers
 cache_headers = {'Pragma':'no-cache', 'Cache-Control': 'post-check=0, pre-check=0',
                  'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
                  'Expires': '-1'}
-                 
+
 cache_removal = [k.lower() for k in cache_headers.keys()]
 cache_additions = cache_headers.items()
-    
+
 def is_hop_by_hop(header):
     """check if the given header is hop_by_hop"""
     return _hoppish.has_key(header.lower())
@@ -63,7 +64,7 @@ class IterativeResponse(object):
     def __init__(self, response_instance):
         self.response_instance = response_instance
         self.read_size = response_instance.length / 100
-                
+
     def __iter__(self):
         yield self.response_instance.read(self.read_size)
         while self.response_instance.chunk_left is not None:
@@ -74,7 +75,7 @@ class IterativeResponse(object):
                 yield self.response_instance.read(self.read_size)
 
 def get_wsgi_response(response):
-        
+
     if type(response) is str:
         return [response]
     if response.length > 512000:
@@ -106,6 +107,32 @@ def proxy_post_redirect_form(environ, action):
     return form.encode('utf-8')
 
 forward_forms = {}
+
+def get_proper_proxy(url):
+    """ Match a url with proxy rules if provided.
+
+    settings['HTTP_PROXY_RULES'] = {
+        'proxy1_host:port': [
+            '*.a.com',
+            '*.b.com',
+            ...
+        ],
+        ...
+    }
+    """
+    default_proxy = windmill.settings.get('HTTP_PROXY', None)
+    rules = windmill.settings.get('HTTP_PROXY_RULES', None)
+    if not rules:
+        return default_proxy
+
+    for proxy, patterns in rules.iteritems():
+        for i in patterns:
+            i = i.replace('.', '\\.').replace('*', '[a-zA-Z0-9\-]+')
+            ret = re.findall(i, url, re.UNICODE)
+            if ret:
+                return proxy
+
+    return default_proxy
 
 class WindmillProxyApplication(object):
     """Application to handle requests that need to be proxied"""
@@ -140,7 +167,7 @@ class WindmillProxyApplication(object):
             if (self.fmgr.is_static_forwarded(url)):
                 environ = self.fmgr.forward(url, environ)
                 url = self.fmgr.forward_map(url)
-            
+
             elif ( url.scheme+"://"+url.netloc != test_target.scheme+"://"+test_target.netloc ):
                 # if the url's network address is not the test URL that has
                 # been set we need to return a forward
@@ -149,14 +176,14 @@ class WindmillProxyApplication(object):
                 if environ['REQUEST_METHOD'] == 'POST':
                     form = proxy_post_redirect_form(environ, redirect_url)
                     forward_forms[redirect_url] = form
-                start_response("302 Found", [('Location', redirect_url), 
+                start_response("302 Found", [('Location', redirect_url),
                                              ]+cache_additions)
                 logger.debug('Domain change, forwarded to ' + redirect_url)
                 return ['']
             elif url.geturl() in forward_forms:
                 response = forward_forms[url.geturl()]
                 length = str(len(response))
-                start_response("200 Ok", [('Content-Type', 'text/html',), 
+                start_response("200 Ok", [('Content-Type', 'text/html',),
                                           ('Content-Length', length,),
                                          ]+cache_additions)
                 del forward_forms[url.geturl()]
@@ -170,7 +197,7 @@ class WindmillProxyApplication(object):
                referer is not None and
                self.fmgr.is_forward_mapped(urlparse(referer))):
                 # This handles the case that the referer is a url we've already
-                # done a cross-domain request for 
+                # done a cross-domain request for
                 orig_referer = self.fmgr.forward_unmap(urlparse(referer))
                 orig_url = self.fmgr.forward_to(url, orig_referer)
                 environ = self.fmgr.change_environ_domain(url, orig_url, environ)
@@ -178,8 +205,16 @@ class WindmillProxyApplication(object):
                 self.fmgr.forward(orig_url, {}) # Take note of the forwarding
         def make_remote_connection(url, environ):
             # Create connection object
+            proxy_proxy = get_proper_proxy(url.netloc)
+            if proxy_proxy:
+                proxy_host, proxy_port = proxy_proxy.split(':')
+            print proxy_proxy
+
             try:
-                connection = self.get_connection(url)
+                if proxy_proxy:
+                    connection = HTTPConnection(proxy_host, proxy_port)
+                else:
+                    connection = self.get_connection(url)
                 # Build path
                 path = url.geturl().replace(url.scheme+'://'+url.netloc, '')
             except Exception, e:
@@ -187,7 +222,7 @@ class WindmillProxyApplication(object):
                 return [("501 Gateway error", [('Content-Type', 'text/html')],),
                         '<H1>Could not connect:</H1><pre>%s</pre>' % (str(e),)]
 
-            # Read in request body if it exists    
+            # Read in request body if it exists
             body = None
             if environ.has_key('body'):
                 body = environ['body']
@@ -219,18 +254,23 @@ class WindmillProxyApplication(object):
 
             # Add our host if one isn't defined
             if not headers.has_key('host'):
-                headers['host'] = environ['SERVER_NAME']   
+                headers['host'] = environ['SERVER_NAME']
 
             # Make the remote request
             try:
-                
+
                 logger.debug('%s %s %s' % (environ['REQUEST_METHOD'], path,
                                            str(headers)))
-                connection.request(environ['REQUEST_METHOD'], path, body=body,
+                if proxy_proxy:
+                    connection.request(environ['REQUEST_METHOD'], url.geturl(), body=body,
+                                   headers=headers)
+                else:
+                    connection.request(environ['REQUEST_METHOD'], path, body=body,
                                    headers=headers)
                 connection.url = url
                 return connection
             except Exception, e:
+                print e
                 # We need extra exception handling in the case the server
                 # fails in mid connection, it's an edge case but I've seen it
                 return [("501 Gateway error", [('Content-Type', 'text/html')],),
@@ -264,18 +304,18 @@ class WindmillProxyApplication(object):
         if isinstance(connection, HTTPConnection):
             response = connection.getresponse()
             response.url = connection.url
-            
+
         if environ['REQUEST_METHOD'] == 'POST':
             threshold = 399
         else:
-            threshold = 399 
+            threshold = 399
 
         if not isinstance(connection, HTTPConnection) or \
             response.status > threshold:
             # if it's not an HTTPConnection object then the request failed
             # so we should retry
             new_response = retry_known_hosts(url, environ)
-            if new_response is not None: 
+            if new_response is not None:
                 response = new_response
             elif not isinstance(connection, HTTPConnection):
                 status = connection[0][0]
@@ -300,7 +340,7 @@ class WindmillProxyApplication(object):
             if header[0].lower() in cache_removal:
                 headers.remove(header)
 
-        start_response(response.status.__str__()+' '+response.reason, 
+        start_response(response.status.__str__()+' '+response.reason,
                        headers+cache_additions)
         return get_wsgi_response(response)
 
@@ -340,3 +380,4 @@ proxyInstances = []
 def clearForwardingRegistry():
     for p in proxyInstances:
         p.clearForwardingRegistry()
+
